@@ -129,7 +129,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     dev = torch.device(args.main_device)
     device_ids = list(map(lambda x: int(x), args.device_ids.split(",")))
-    output_dir="output/{}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    output_dir="output/{}".format(datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))
     
     batch_size = args.batch_size
     num_workers = args.num_workers
