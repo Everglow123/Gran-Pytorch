@@ -98,7 +98,7 @@ class NaryExample:
     auxiliary_info: OrderedDict = field(default_factory=OrderedDict)
 
 
-def read_examples(input_file) -> Tuple[List[NaryExample], int]:
+def read_examples(input_file) -> List[NaryExample]:
     """
     Read a n-ary json file into a list of NaryExample.
     """

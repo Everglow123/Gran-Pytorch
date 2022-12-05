@@ -214,7 +214,7 @@ class Trainer(object):
             metrics_result = self.metrics_cal_func(metrics)
             if self.lr_scheduler != None:
                 self.lr_scheduler.step()
-            self.logger.info("epoch {0} : trainging mean loss {1}".format(
+            self.logger.info("epoch {0} : training mean loss {1}".format(
                 epoch, total_loss/len(self.training_dataloader)))
             for k, v in metrics_result.items():
                 self.logger.info(

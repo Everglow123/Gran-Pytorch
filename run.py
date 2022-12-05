@@ -6,11 +6,14 @@
 @说明    :
 """
 from ast import arg
+import dataclasses
+from datetime import datetime
 import os
 import sys
 import pickle
 import random
 import json
+from time import time
 from typing import Any, Dict
 from typing_extensions import Literal
 
@@ -104,13 +107,13 @@ model_g.add_arg(
 
 
 train_g = ArgumentGroup(parser, "training", "training options.")
-train_g.add_arg("batch_size", int, 256, "Batch size.")
+train_g.add_arg("batch_size", int,1024, "Batch size.")
 train_g.add_arg("epoch", int, 100, "Number of training epochs.")
 train_g.add_arg("learning_rate", float, 5e-4, "Learning rate with warmup.")
 train_g.add_arg("gradient_accumulate",int, 1, "gradient accumulate steps")
 train_g.add_arg("main_device", int, 0, "main gpu device for training")
-train_g.add_arg("device_ids", str, "0,1", "all available gpu devices for training")
-train_g.add_arg("num_workers", int, 24, "processes for preparing batch data")
+train_g.add_arg("device_ids", str, "0", "all available gpu devices for training")
+train_g.add_arg("num_workers", int, 12, "processes for preparing batch data")
 
 data_g = ArgumentGroup(
     parser, "data", "Data paths, vocab paths and data processing options."
@@ -126,11 +129,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     dev = torch.device(args.main_device)
     device_ids = list(map(lambda x: int(x), args.device_ids.split(",")))
+    output_dir="output/{}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    
     batch_size = args.batch_size
     num_workers = args.num_workers
     learning_rate = args.learning_rate
     epochs = args.epoch
     gradient_accumulate = args.gradient_accumulate
+    
     config=GranConfig(
         voc_size=args.vocab_size,
         n_relation=args.num_relations,
@@ -148,7 +154,9 @@ if __name__ == "__main__":
         e_soft_label=args.entity_soft_label,
         r_soft_label=args.relation_soft_label
     )
-
+    with open("config.json","w") as f:
+        json.dump(config,f,default=dataclasses.asdict,indent=4,ensure_ascii=False)
+    
     train_examples=read_examples(args.train_file)
     valid_examples=read_examples(args.predict_file)
     vocabulary=Vocabulary(args.vocab_path,num_relations=config.n_relation,num_entities=config.voc_size-config.n_relation-2)
@@ -173,7 +181,7 @@ if __name__ == "__main__":
     trainer=Trainer(
         model=model,
             optimizer=optimizer,
-            output_dir="output",
+            output_dir=output_dir,
             training_dataset=train_dataset,
             valid_dataset=valid_dataset,
             test_dataset=None,

@@ -9,6 +9,7 @@
 
 from ast import Not
 from dataclasses import dataclass
+from functools import partial, reduce
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
@@ -51,6 +52,28 @@ def gen_act_func(act: str) -> Callable[[Tensor], Tensor]:
     res = eval("F." + act)
     return res
 
+class GranLayerNorm(Module):
+    def __init__(self,input_shape,begin_axis,epsilon=1e-12) -> None:
+        super().__init__()
+        self.input_shape=input_shape
+        self.begin_axis=begin_axis
+        self.epsilon=epsilon
+        self.param_shape=[reduce(lambda x,y:x*y,input_shape[begin_axis:])]
+        self.scale=torch.nn.parameter.Parameter(
+            data=torch.full(self.param_shape,1.0,dtype=torch.float32)
+        )
+        self.bias=torch.nn.parameter.Parameter(
+            data=torch.full(self.param_shape,0.0,dtype=torch.float32)
+        )
+    def forward(self,x:Tensor)->Tensor:
+        mean=x.mean(dim=self.begin_axis,keepdim=True)
+        shift_x=x-mean
+        variance=shift_x.square().mean(dim=self.begin_axis,keepdim=True)
+        r_stdev=(variance+self.epsilon).rsqrt()
+        norm_x=shift_x*r_stdev
+        out=norm_x*self.scale
+        out=out+self.bias
+        return out
 
 class GranPrePostProcessLayer(Module):
     def __init__(
@@ -61,22 +84,31 @@ class GranPrePostProcessLayer(Module):
     ) -> None:
         super().__init__()
         layers: List[Module] = []
-        for cmd in process_cmd:
+        self.str_idx_to_layer_idx:Dict[int,int]={}
+        self.cmd=process_cmd
+        for idx,cmd in enumerate(process_cmd):
             if cmd == "n":
-                layer = LayerNorm(shape, dtype=torch.float32)
+                layer =GranLayerNorm(shape,len(shape)-1)
+                self.str_idx_to_layer_idx[idx]=len(layers)
                 layers.append(layer)
+
             elif cmd == "d":
-                rate = 0.5
-                if dropout_rate:
+                if dropout_rate is not None and dropout_rate>0.0:
                     rate = dropout_rate
                     layer = Dropout(rate)
+                    self.str_idx_to_layer_idx[idx]=len(layers)
                     layers.append(layer)
-        self.layers: Sequential = Sequential(*layers)
+        self.layers:torch.nn.ModuleList = torch.nn.ModuleList(layers)
 
     def forward(self, input: Tensor, prev=None):
-        if prev is not None:
-            input = prev + input
-        return self.layers(input)
+        for idx,c in enumerate(self.cmd):
+            if c=='a':
+                if prev is not None:
+                    input = prev + input
+            elif c=='d' or c=='n':
+                input=self.layers[self.str_idx_to_layer_idx[idx]](input)
+
+        return input
 
 
 class GranPositionWiseFeedForward(Module):
@@ -169,7 +201,7 @@ class GranMultiHeadAttention(Module):
             edge_bias = torch.permute(edge_bias, [1, 2, 0, 3])
             product += edge_bias
             product += attn_bias
-        weights = F.softmax(product)
+        weights = F.softmax(product,dim=-1)
         if self.dropout_rate:
             weights = F.dropout(weights, self.dropout_rate)
         out = torch.matmul(weights, v)
@@ -313,6 +345,7 @@ class GranEncoder(Module):
         hidden_act=F.relu,
         preprocess_cmd="",
         postprocess_cmd="dan",
+
     ) -> None:
         super().__init__()
         self.n_layer = n_layer
@@ -356,18 +389,21 @@ class GranEncoder(Module):
 
 
 class GranModel(Module):
+    parameter_initializer_:Callable[[Tensor],None]=None
     def __init__(
         self,config: GranConfig, weight_sharing=True
     ) -> None:
         super().__init__()
         self.weight_sharing = weight_sharing
         self.config = config
+        GranModel.parameter_initializer_=partial(torch.nn.init.trunc_normal_,a=-config.initializer_range,b=config.initializer_range)
         self.pre_post_process_layer1 = GranPrePostProcessLayer(
             [self.config.max_seq_len, self.config.emb_size],
             "nd",
             self.config.prepostprocess_dropout,
         )
         self.ent_embedding = Embedding(self.config.voc_size, self.config.emb_size)
+        self.parameter_initializer_(self.ent_embedding.weight)
         self.edge_key_embedding = Embedding(
             self.config.n_edge, self.config.emb_size // self.config.n_head
         )
@@ -401,7 +437,14 @@ class GranModel(Module):
             data=torch.zeros([self.config.voc_size])
         )
         self.mask_lm_out_fc = Linear(self.config.emb_size, self.config.voc_size)
-        
+        self.apply(GranModel._initialize_parameters)
+    @staticmethod
+    def _initialize_parameters(m):
+        if isinstance(m,Embedding):
+            GranModel.parameter_initializer_(m.weight)
+        elif isinstance(m,Linear):
+            GranModel.parameter_initializer_(m.weight)
+            m.bias.data.fill_(0.01)
     def _build_edge_labels(self) -> torch.Tensor:
         edge_labels = []
         max_aux = self.config.max_arity - 2
@@ -454,10 +497,10 @@ class GranModel(Module):
             [self.config.max_seq_len, self.config.max_seq_len, -1]
         )
         attn_mask = torch.matmul(input_mask, input_mask.transpose(1, 2))
-        attn_mask = 1000000.0 * (attn_mask - 0.1)
+        attn_mask = 1000000.0 * (attn_mask - 1.0)
         n_head_self_attn_mask = [attn_mask] * self.config.n_head
         n_head_self_attn_mask = torch.stack(n_head_self_attn_mask, dim=1)
-        n_head_self_attn_mask = n_head_self_attn_mask.detach_()
+        # n_head_self_attn_mask = n_head_self_attn_mask.detach_()
 
         # batch_size * max_seq_len * emb_size
         enc_out = self.encoder(emb_out, edges_key, edges_value, n_head_self_attn_mask)
@@ -524,6 +567,7 @@ def batch_cal_loss_func(
     mask_labels, mask_type, _ = labels
     fc_out, type_indicator = preds
     mask_labels = mask_labels.reshape([-1])
+    # return F.cross_entropy(fc_out,mask_labels,label_smoothing=0.05,reduction="mean")
     batch_size = mask_labels.shape[0]
     # batch_size * vocab_size
     one_hot_labels: Tensor = F.one_hot(mask_labels, model.config.voc_size)
@@ -546,8 +590,8 @@ def batch_cal_loss_func(
     )
 
     log_out = F.log_softmax(fc_out, dim=1)
-    loss = (-(log_out * soft_labels)).sum(-1) / batch_size
-    return loss.mean()
+    loss = (-(log_out * soft_labels)).sum()
+    return loss / batch_size
 
 
 def batch_forward_func(batch_data: Tuple[torch.Tensor, ...], trainer):
@@ -710,7 +754,8 @@ class BatchMetricsFunc:
         _n_a_lst.extend(_n_a_ranks)
         _n_v_lst.extend(_n_v_ranks)
 
-        return metrics,ret_ranks
+        batch_metrics={"entity":ret_ranks["entity"]}
+        return metrics,batch_metrics
 
 
 class MetricsCalFunc:
